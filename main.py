@@ -1,11 +1,13 @@
 import asyncio
 import gc
+import io
 import os
 import shutil
 import subprocess
 import sys
 import uuid
 from typing import List, Optional
+from urllib.parse import quote
 
 import edge_tts
 import imageio_ffmpeg
@@ -29,10 +31,10 @@ app = FastAPI(
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_USER_ID = os.getenv("LINE_USER_ID", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
 VOICE = "th-TH-NiwatNeural"
 FONT_PATH = "thai_font.ttf"
@@ -78,28 +80,37 @@ def create_fallback_image(output_image: str):
 
 
 def generate_ai_image(prompt: str, output_image: str):
-    """Generate a vertical 9:16 editorial news image via Hugging Face FLUX.1-schnell."""
-    if not HF_TOKEN:
-        print("⚠️ HF_TOKEN not set, using fallback gradient background.", flush=True)
-        create_fallback_image(output_image)
-        return
+    """Generate a vertical 9:16 editorial news image (HF -> Pollinations free AI -> gradient fallback)."""
+    enhanced_prompt = (
+        f"{prompt}, modern editorial news illustration style, cinematic lighting, "
+        "high detail, vibrant colors, vertical 9:16 composition, no text, no watermark"
+    )
+
+    if HF_TOKEN:
+        try:
+            client = InferenceClient(api_key=HF_TOKEN)
+            image = client.text_to_image(
+                prompt=enhanced_prompt,
+                model="black-forest-labs/FLUX.1-schnell",
+                width=544,
+                height=960,
+            )
+            image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+            image.save(output_image)
+            return
+        except Exception as e:
+            print(f"⚠️ HF Image failed ({e}), trying Pollinations.ai...", flush=True)
 
     try:
-        client = InferenceClient(api_key=HF_TOKEN)
-        enhanced_prompt = (
-            f"{prompt}, modern editorial news illustration style, cinematic lighting, "
-            "high detail, vibrant colors, vertical 9:16 composition, no text, no watermark"
-        )
-        image = client.text_to_image(
-            prompt=enhanced_prompt,
-            model="black-forest-labs/FLUX.1-schnell",
-            width=544,
-            height=960,
-        )
+        url = f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}?width=544&height=960&nologo=true"
+        res = requests.get(url, timeout=35)
+        res.raise_for_status()
+        image = Image.open(io.BytesIO(res.content)).convert("RGB")
         image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
         image.save(output_image)
+        return
     except Exception as e:
-        print(f"⚠️ Image generation failed ({e}), using fallback background.", flush=True)
+        print(f"⚠️ Pollinations failed ({e}), using fallback background.", flush=True)
         create_fallback_image(output_image)
 
 
