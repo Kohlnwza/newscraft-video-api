@@ -17,7 +17,7 @@ import requests
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import InferenceClient
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel
 
 # Ensure logs appear immediately in Render
@@ -81,49 +81,108 @@ def create_fallback_image(output_image: str):
     img.save(output_image)
 
 
+def fetch_openverse_image(query: str, output_image: str) -> bool:
+    """Fetch a real editorial/stock photo from Openverse (free, no API key)."""
+    try:
+        res = requests.get(
+            "https://api.openverse.org/v1/images/",
+            params={"q": query, "page_size": 5},
+            headers={"User-Agent": "NewsCraftAI/1.0"},
+            timeout=10,
+        )
+        res.raise_for_status()
+        for item in res.json().get("results", []):
+            img_url = item.get("thumbnail") or item.get("url")
+            if not img_url:
+                continue
+            try:
+                img_res = requests.get(img_url, headers={"User-Agent": "NewsCraftAI/1.0"}, timeout=12)
+                img_res.raise_for_status()
+                image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
+                image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+                image.save(output_image)
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Openverse search failed ({e})", flush=True)
+    return False
+
+
+def fetch_wikimedia_image(query: str, output_image: str) -> bool:
+    """Fetch a real photo from Wikimedia Commons (free, no API key)."""
+    try:
+        res = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrnamespace": 6,
+                "gsrlimit": 5,
+                "prop": "imageinfo",
+                "iiprop": "url|mime",
+                "iiurlwidth": 720,
+                "format": "json",
+            },
+            headers={"User-Agent": "NewsCraftAI/1.0"},
+            timeout=10,
+        )
+        res.raise_for_status()
+        pages = res.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            info = (page.get("imageinfo") or [{}])[0]
+            mime = info.get("mime", "")
+            img_url = info.get("thumburl") or info.get("url")
+            if not img_url or not mime.startswith("image/") or "svg" in mime:
+                continue
+            try:
+                img_res = requests.get(img_url, headers={"User-Agent": "NewsCraftAI/1.0"}, timeout=12)
+                img_res.raise_for_status()
+                image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
+                image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+                image.save(output_image)
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Wikimedia search failed ({e})", flush=True)
+    return False
+
+
 def generate_ai_image(prompt: str, output_image: str):
-    """Generate a vertical 9:16 editorial news image (HF -> Pollinations free AI -> gradient fallback)."""
+    """Get a vertical 9:16 visual (Pollinations -> Openverse -> Wikimedia -> gradient fallback)."""
     enhanced_prompt = (
         f"{prompt}, modern editorial news illustration style, cinematic lighting, "
         "high detail, vibrant colors, vertical 9:16 composition, no text, no watermark"
     )
 
-    if HF_TOKEN:
-        try:
-            client = InferenceClient(api_key=HF_TOKEN)
-            image = client.text_to_image(
-                prompt=enhanced_prompt,
-                model="black-forest-labs/FLUX.1-schnell",
-                width=544,
-                height=960,
-            )
-            image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-            image.save(output_image)
-            return
-        except Exception as e:
-            print(f"⚠️ HF Image failed ({e}), trying Pollinations.ai...", flush=True)
+    try:
+        seed = random.randint(1, 999999)
+        url = (
+            f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}"
+            f"?width=544&height=1024&seed={seed}&nologo=true"
+        )
+        res = requests.get(url, timeout=18)
+        res.raise_for_status()
+        image = Image.open(io.BytesIO(res.content)).convert("RGB")
+        w, h = image.size
+        image = image.crop((0, 0, w, max(1, h - 64)))
+        image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+        image.save(output_image)
+        return
+    except Exception as e:
+        print(f"⚠️ Pollinations skipped ({e}), searching Openverse...", flush=True)
 
-    for attempt in range(2):
-        try:
-            seed = random.randint(1, 999999)
-            url = (
-                f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}"
-                f"?width=544&height=1024&seed={seed}&nologo=true"
-            )
-            res = requests.get(url, timeout=45)
-            res.raise_for_status()
-            image = Image.open(io.BytesIO(res.content)).convert("RGB")
-            # Crop bottom 64px to remove any provider watermark, then resize to 540x960
-            w, h = image.size
-            image = image.crop((0, 0, w, max(1, h - 64)))
-            image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-            image.save(output_image)
-            return
-        except Exception as e:
-            print(f"⚠️ Pollinations attempt {attempt + 1} failed ({e})", flush=True)
-            time.sleep(2)
+    if fetch_openverse_image(prompt, output_image):
+        print("✅ Image fetched from Openverse", flush=True)
+        return
 
-    print("⚠️ All image attempts failed, using fallback background.", flush=True)
+    if fetch_wikimedia_image(prompt, output_image):
+        print("✅ Image fetched from Wikimedia", flush=True)
+        return
+
+    print("⚠️ All image sources failed, using fallback background.", flush=True)
     create_fallback_image(output_image)
 
 
