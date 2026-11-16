@@ -182,6 +182,20 @@ def generate_ai_image(prompt: str, output_image: str):
         print("✅ Image fetched from Wikimedia", flush=True)
         return
 
+    words = prompt.split()
+    if len(words) > 2:
+        short_query = " ".join(words[:2])
+        if fetch_openverse_image(short_query, output_image):
+            print(f"✅ Image fetched from Openverse (short: {short_query})", flush=True)
+            return
+        if fetch_wikimedia_image(short_query, output_image):
+            print(f"✅ Image fetched from Wikimedia (short: {short_query})", flush=True)
+            return
+
+    if fetch_openverse_image("technology news", output_image):
+        print("✅ Image fetched from Openverse (generic fallback)", flush=True)
+        return
+
     print("⚠️ All image sources failed, using fallback background.", flush=True)
     create_fallback_image(output_image)
 
