@@ -2,7 +2,7 @@ fastapi
 uvicorn
 pydantic
 edge-tts
-moviepy>=2.0.0
+imageio-ffmpeg
 requests
 pillow
 huggingface_hub

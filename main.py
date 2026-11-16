@@ -3,6 +3,7 @@ import gc
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from typing import List, Optional
 
@@ -12,14 +13,12 @@ import requests
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import InferenceClient
-from moviepy import (
-    AudioFileClip,
-    CompositeVideoClip,
-    ImageClip,
-    TextClip,
-)
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
+
+# Ensure logs appear immediately in Render
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 app = FastAPI(
     title="NewsCraft Video Rendering API",
@@ -37,8 +36,8 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 VOICE = "th-TH-NiwatNeural"
 FONT_PATH = "thai_font.ttf"
-VIDEO_WIDTH = 720
-VIDEO_HEIGHT = 1280
+VIDEO_WIDTH = 540
+VIDEO_HEIGHT = 960
 
 
 class SceneItem(BaseModel):
@@ -68,21 +67,20 @@ async def generate_tts(text: str, output_audio: str):
 
 def create_fallback_image(output_image: str):
     """Create a dark gradient 9:16 background image when HF_TOKEN is unset or API fails."""
-    width, height = 544, 960
-    img = Image.new("RGB", (width, height), (18, 24, 38))
+    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), (18, 24, 38))
     draw = ImageDraw.Draw(img)
-    for y in range(height):
-        r = int(18 + (y / height) * 16)
-        g = int(24 + (y / height) * 28)
-        b = int(38 + (y / height) * 42)
-        draw.line([(0, y), (width, y)], fill=(r, g, b))
+    for y in range(VIDEO_HEIGHT):
+        r = int(18 + (y / VIDEO_HEIGHT) * 16)
+        g = int(24 + (y / VIDEO_HEIGHT) * 28)
+        b = int(38 + (y / VIDEO_HEIGHT) * 42)
+        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(r, g, b))
     img.save(output_image)
 
 
 def generate_ai_image(prompt: str, output_image: str):
     """Generate a vertical 9:16 editorial news image via Hugging Face FLUX.1-schnell."""
     if not HF_TOKEN:
-        print("⚠️ HF_TOKEN not set, using fallback gradient background.")
+        print("⚠️ HF_TOKEN not set, using fallback gradient background.", flush=True)
         create_fallback_image(output_image)
         return
 
@@ -98,23 +96,77 @@ def generate_ai_image(prompt: str, output_image: str):
             width=544,
             height=960,
         )
+        image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
         image.save(output_image)
     except Exception as e:
-        print(f"⚠️ Image generation failed ({e}), using fallback background.")
+        print(f"⚠️ Image generation failed ({e}), using fallback background.", flush=True)
         create_fallback_image(output_image)
 
 
-def apply_ken_burns_zoom(img_path: str, duration: float):
-    """Apply subtle Ken Burns zoom-in effect to a 720x1280 image clip."""
-    clip = ImageClip(img_path).with_duration(duration).resized((VIDEO_WIDTH, VIDEO_HEIGHT))
-    zoomed_clip = clip.resized(lambda t: 1.0 + 0.06 * (t / duration))
-    return CompositeVideoClip([zoomed_clip.with_position("center")], size=(VIDEO_WIDTH, VIDEO_HEIGHT))
+def wrap_thai_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+    """Wrap Thai/mixed text by pixel width."""
+    lines = []
+    current = ""
+    for ch in text:
+        test = current + ch
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = ch
+    if current:
+        lines.append(current)
+    return lines
+
+
+def overlay_headline_on_image(img_path: str, text: str, out_path: str):
+    """Draw Thai headline with semi-transparent dark backdrop and yellow text."""
+    base = Image.open(img_path).convert("RGBA").resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    font = ImageFont.truetype(FONT_PATH, 38)
+    lines = wrap_thai_text(draw, text.strip(), font, VIDEO_WIDTH - 80)
+
+    line_height = 54
+    total_h = len(lines) * line_height
+    start_y = 180
+
+    # Subtle dark pill box behind text for high contrast
+    box_pad_y = 18
+    draw.rounded_rectangle(
+        [(28, start_y - box_pad_y), (VIDEO_WIDTH - 28, start_y + total_h + box_pad_y)],
+        radius=16,
+        fill=(0, 0, 0, 150),
+    )
+
+    y = start_y
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        text_w = bbox[2] - bbox[0]
+        x = (VIDEO_WIDTH - text_w) // 2
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=(255, 230, 0, 255),
+            stroke_width=3,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        y += line_height
+
+    combined = Image.alpha_composite(base, overlay).convert("RGB")
+    combined.save(out_path, quality=92)
+    base.close()
+    overlay.close()
+    combined.close()
 
 
 def send_video_to_line(video_url: str, project_name: str):
     """Push the rendered .mp4 video URL back to the LINE OA chat."""
     if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_USER_ID):
-        print("⚠️ LINE_CHANNEL_ACCESS_TOKEN or LINE_USER_ID not configured.")
+        print("⚠️ LINE_CHANNEL_ACCESS_TOKEN or LINE_USER_ID not configured.", flush=True)
         return
 
     headers = {
@@ -139,64 +191,72 @@ def send_video_to_line(video_url: str, project_name: str):
         ],
     }
     res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=data, timeout=30)
-    print("LINE Push Status:", res.status_code, res.text)
+    print(f"LINE Push Status: {res.status_code} {res.text}", flush=True)
 
 
-def render_single_scene(item: SceneItem, work_dir: str, duration: float) -> str:
-    """Render one scene to a standalone MP4 to keep peak RAM well below 512 MB."""
+def render_single_scene(item: SceneItem, work_dir: str, ffmpeg_exe: str) -> str:
+    """Render one scene with pure Pillow + ffmpeg for minimal RAM usage."""
     idx = item.scene
     audio_path = f"{work_dir}/scene_{idx}.mp3"
-    img_path = f"{work_dir}/scene_{idx}.png"
+    raw_img_path = f"{work_dir}/scene_{idx}_raw.png"
+    text_img_path = f"{work_dir}/scene_{idx}_txt.jpg"
     scene_mp4 = f"{work_dir}/scene_{idx}.mp4"
 
-    generate_ai_image(item.visual_search_query, img_path)
+    print(f"🎨 Scene {idx}: generating image...", flush=True)
+    generate_ai_image(item.visual_search_query, raw_img_path)
+    overlay_headline_on_image(raw_img_path, item.on_screen_text, text_img_path)
 
-    audio_clip = None
-    bg_clip = None
-    txt_clip = None
-    scene_composite = None
-
-    try:
-        audio_clip = AudioFileClip(audio_path)
-        bg_clip = apply_ken_burns_zoom(img_path, duration)
-        txt_clip = (
-            TextClip(
-                text=item.on_screen_text,
-                font=FONT_PATH,
-                font_size=46,
-                color="yellow",
-                stroke_color="black",
-                stroke_width=3,
-                method="caption",
-                size=(620, None),
-                margin=(16, 16),
-            )
-            .with_position(("center", 230))
-            .with_duration(duration)
-        )
-        scene_composite = CompositeVideoClip([bg_clip, txt_clip]).with_audio(audio_clip)
-        scene_composite.write_videofile(
+    print(f"🎞️ Scene {idx}: encoding video...", flush=True)
+    subprocess.run(
+        [
+            ffmpeg_exe,
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            "15",
+            "-i",
+            text_img_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "stillimage",
+            "-threads",
+            "1",
+            "-crf",
+            "26",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-shortest",
             scene_mp4,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            ffmpeg_params=["-preset", "ultrafast", "-threads", "1", "-crf", "26"],
-            logger=None,
-        )
-    finally:
-        for clip in (scene_composite, txt_clip, bg_clip, audio_clip):
-            if clip is not None:
-                clip.close()
-        gc.collect()
-
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    gc.collect()
     return scene_mp4
 
 
-def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_durations: dict):
+def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str):
     """Render each scene sequentially and concat with ffmpeg stream copy."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     scene_files = []
+
     for item in payload.scenes:
-        scene_mp4 = render_single_scene(item, work_dir, audio_durations[item.scene])
+        scene_mp4 = render_single_scene(item, work_dir, ffmpeg_exe)
         scene_files.append(os.path.abspath(scene_mp4))
 
     safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
@@ -208,7 +268,6 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_d
         for path in scene_files:
             f.write(f"file '{path}'\n")
 
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     subprocess.run(
         [
             ffmpeg_exe,
@@ -224,11 +283,13 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_d
             output_path,
         ],
         check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
     base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://localhost:8000"
     public_video_url = f"{base_url}/outputs/{output_filename}"
-    print(f"✅ Render complete: {output_path}")
+    print(f"✅ Render complete: {output_path}", flush=True)
 
     send_video_to_line(public_video_url, payload.project)
 
@@ -236,20 +297,18 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_d
 async def process_and_render_video(payload: VideoPayload, job_id: str):
     work_dir = f"temp_{job_id}"
     os.makedirs(work_dir, exist_ok=True)
-    audio_durations = {}
+    print(f"🚀 Job {job_id}: starting ({len(payload.scenes)} scenes)", flush=True)
 
     try:
         for item in payload.scenes:
             idx = item.scene
             audio_path = f"{work_dir}/scene_{idx}.mp3"
+            print(f"🎙️ Scene {idx}: generating TTS...", flush=True)
             await generate_tts(item.voiceover_text, audio_path)
-            a_clip = AudioFileClip(audio_path)
-            audio_durations[idx] = a_clip.duration + 0.3
-            a_clip.close()
 
-        await asyncio.to_thread(render_video_sync, payload, job_id, work_dir, audio_durations)
+        await asyncio.to_thread(render_video_sync, payload, job_id, work_dir)
     except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดระหว่างสร้างวิดีโอ: {e}")
+        print(f"❌ เกิดข้อผิดพลาดระหว่างสร้างวิดีโอ: {e}", flush=True)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
