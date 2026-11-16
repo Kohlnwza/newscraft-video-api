@@ -2,9 +2,11 @@ import asyncio
 import gc
 import io
 import os
+import random
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from typing import List, Optional
 from urllib.parse import quote
@@ -101,31 +103,57 @@ def generate_ai_image(prompt: str, output_image: str):
         except Exception as e:
             print(f"⚠️ HF Image failed ({e}), trying Pollinations.ai...", flush=True)
 
-    try:
-        url = f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}?width=544&height=960&nologo=true"
-        res = requests.get(url, timeout=35)
-        res.raise_for_status()
-        image = Image.open(io.BytesIO(res.content)).convert("RGB")
-        image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-        image.save(output_image)
-        return
-    except Exception as e:
-        print(f"⚠️ Pollinations failed ({e}), using fallback background.", flush=True)
-        create_fallback_image(output_image)
+    for attempt in range(2):
+        try:
+            seed = random.randint(1, 999999)
+            url = (
+                f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}"
+                f"?width=544&height=1024&seed={seed}&nologo=true"
+            )
+            res = requests.get(url, timeout=45)
+            res.raise_for_status()
+            image = Image.open(io.BytesIO(res.content)).convert("RGB")
+            # Crop bottom 64px to remove any provider watermark, then resize to 540x960
+            w, h = image.size
+            image = image.crop((0, 0, w, max(1, h - 64)))
+            image = image.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+            image.save(output_image)
+            return
+        except Exception as e:
+            print(f"⚠️ Pollinations attempt {attempt + 1} failed ({e})", flush=True)
+            time.sleep(2)
+
+    print("⚠️ All image attempts failed, using fallback background.", flush=True)
+    create_fallback_image(output_image)
 
 
 def wrap_thai_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
-    """Wrap Thai/mixed text by pixel width."""
+    """Wrap text by space-separated words first so Thai words are not split mid-syllable."""
+    words = text.split(" ")
     lines = []
     current = ""
-    for ch in text:
-        test = current + ch
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= max_width or not current:
-            current = test
+
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
         else:
-            lines.append(current)
-            current = ch
+            if current:
+                lines.append(current)
+                current = word
+            else:
+                # Single long token without spaces: split by character
+                chunk = ""
+                for ch in word:
+                    test = chunk + ch
+                    if draw.textbbox((0, 0), test, font=font)[2] <= max_width or not chunk:
+                        chunk = test
+                    else:
+                        lines.append(chunk)
+                        chunk = ch
+                current = chunk
+
     if current:
         lines.append(current)
     return lines
@@ -137,12 +165,12 @@ def overlay_headline_on_image(img_path: str, text: str, out_path: str):
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    font = ImageFont.truetype(FONT_PATH, 38)
-    lines = wrap_thai_text(draw, text.strip(), font, VIDEO_WIDTH - 80)
+    font = ImageFont.truetype(FONT_PATH, 34)
+    lines = wrap_thai_text(draw, text.strip(), font, VIDEO_WIDTH - 72)
 
-    line_height = 54
+    line_height = 50
     total_h = len(lines) * line_height
-    start_y = 180
+    start_y = 170
 
     # Subtle dark pill box behind text for high contrast
     box_pad_y = 18
