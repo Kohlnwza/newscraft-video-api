@@ -32,6 +32,7 @@ os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
@@ -80,19 +81,60 @@ def create_fallback_image(output_image: str):
     img.save(output_image, quality=92)
 
 
-def fetch_openverse_image(query: str, output_image: str) -> bool:
-    """Fetch a real editorial/stock photo from Openverse (free, no API key)."""
+def clean_search_query(query: str) -> str:
+    """Remove abstract/style words so stock photo search focuses on concrete visual subjects."""
+    stop_words = {
+        "illustration", "editorial", "modern", "cinematic", "concept",
+        "abstract", "background", "graph", "chart", "infographic", "style",
+    }
+    words = [w for w in query.replace(",", " ").split() if w.lower() not in stop_words]
+    return " ".join(words) if words else query
+
+
+def fetch_pexels_image(query: str, output_image: str, used_urls: set) -> bool:
+    """Fetch a crisp 9:16 portrait photo from Pexels API (free key from pexels.com/api)."""
+    if not PEXELS_API_KEY:
+        return False
+    try:
+        res = requests.get(
+            "https://api.pexels.com/v1/search",
+            params={"query": query, "orientation": "portrait", "per_page": 5},
+            headers={"Authorization": PEXELS_API_KEY, "User-Agent": "NewsCraftAI/1.0"},
+            timeout=10,
+        )
+        res.raise_for_status()
+        for photo in res.json().get("photos", []):
+            img_url = (photo.get("src") or {}).get("large2x") or (photo.get("src") or {}).get("large")
+            if not img_url or img_url in used_urls:
+                continue
+            try:
+                img_res = requests.get(img_url, timeout=12)
+                img_res.raise_for_status()
+                image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
+                image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+                image.save(output_image, quality=92)
+                used_urls.add(img_url)
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Pexels search failed ({e})", flush=True)
+    return False
+
+
+def fetch_openverse_image(query: str, output_image: str, used_urls: set) -> bool:
+    """Fetch a real photograph from Openverse (free, no API key)."""
     try:
         res = requests.get(
             "https://api.openverse.org/v1/images/",
-            params={"q": query, "page_size": 5},
+            params={"q": query, "category": "photograph", "mature": "false", "page_size": 8},
             headers={"User-Agent": "NewsCraftAI/1.0"},
             timeout=10,
         )
         res.raise_for_status()
         for item in res.json().get("results", []):
             img_url = item.get("thumbnail") or item.get("url")
-            if not img_url:
+            if not img_url or img_url in used_urls:
                 continue
             try:
                 img_res = requests.get(img_url, headers={"User-Agent": "NewsCraftAI/1.0"}, timeout=12)
@@ -100,6 +142,7 @@ def fetch_openverse_image(query: str, output_image: str) -> bool:
                 image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
                 image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
                 image.save(output_image, quality=92)
+                used_urls.add(img_url)
                 return True
             except Exception:
                 continue
@@ -108,7 +151,7 @@ def fetch_openverse_image(query: str, output_image: str) -> bool:
     return False
 
 
-def fetch_wikimedia_image(query: str, output_image: str) -> bool:
+def fetch_wikimedia_image(query: str, output_image: str, used_urls: set) -> bool:
     """Fetch a real photo from Wikimedia Commons (free, no API key)."""
     try:
         res = requests.get(
@@ -118,7 +161,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
                 "generator": "search",
                 "gsrsearch": query,
                 "gsrnamespace": 6,
-                "gsrlimit": 5,
+                "gsrlimit": 8,
                 "prop": "imageinfo",
                 "iiprop": "url|mime",
                 "iiurlwidth": 1080,
@@ -133,7 +176,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
             info = (page.get("imageinfo") or [{}])[0]
             mime = info.get("mime", "")
             img_url = info.get("thumburl") or info.get("url")
-            if not img_url or not mime.startswith("image/") or "svg" in mime:
+            if not img_url or img_url in used_urls or not mime.startswith("image/") or "svg" in mime:
                 continue
             try:
                 img_res = requests.get(img_url, headers={"User-Agent": "NewsCraftAI/1.0"}, timeout=12)
@@ -141,6 +184,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
                 image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
                 image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
                 image.save(output_image, quality=92)
+                used_urls.add(img_url)
                 return True
             except Exception:
                 continue
@@ -149,8 +193,17 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
     return False
 
 
-def generate_ai_image(prompt: str, output_image: str):
-    """Get a vertical 9:16 visual (Pollinations -> Openverse -> Wikimedia -> short query -> fallback)."""
+def generate_ai_image(prompt: str, output_image: str, used_urls: Optional[set] = None):
+    """Get a relevant 9:16 visual (Pexels -> Pollinations -> Openverse -> Wikimedia -> short query)."""
+    if used_urls is None:
+        used_urls = set()
+
+    clean_q = clean_search_query(prompt)
+
+    if fetch_pexels_image(clean_q, output_image, used_urls):
+        print(f"✅ Image fetched from Pexels ({clean_q})", flush=True)
+        return
+
     enhanced_prompt = (
         f"{prompt}, modern editorial news illustration style, cinematic lighting, "
         "high detail, vibrant colors, vertical 9:16 composition, no text, no watermark"
@@ -162,7 +215,7 @@ def generate_ai_image(prompt: str, output_image: str):
             f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}"
             f"?width=720&height=1344&seed={seed}&nologo=true"
         )
-        res = requests.get(url, timeout=18)
+        res = requests.get(url, timeout=15)
         res.raise_for_status()
         image = Image.open(io.BytesIO(res.content)).convert("RGB")
         w, h = image.size
@@ -171,27 +224,30 @@ def generate_ai_image(prompt: str, output_image: str):
         image.save(output_image, quality=92)
         return
     except Exception as e:
-        print(f"⚠️ Pollinations skipped ({e}), searching Openverse...", flush=True)
+        print(f"⚠️ Pollinations skipped ({e}), searching stock photos...", flush=True)
 
-    if fetch_openverse_image(prompt, output_image):
-        print("✅ Image fetched from Openverse", flush=True)
+    if fetch_openverse_image(clean_q, output_image, used_urls):
+        print(f"✅ Image fetched from Openverse ({clean_q})", flush=True)
         return
 
-    if fetch_wikimedia_image(prompt, output_image):
-        print("✅ Image fetched from Wikimedia", flush=True)
+    if fetch_wikimedia_image(clean_q, output_image, used_urls):
+        print(f"✅ Image fetched from Wikimedia ({clean_q})", flush=True)
         return
 
-    words = prompt.split()
+    words = clean_q.split()
     if len(words) > 2:
         short_query = " ".join(words[:2])
-        if fetch_openverse_image(short_query, output_image):
+        if fetch_pexels_image(short_query, output_image, used_urls):
+            print(f"✅ Image fetched from Pexels (short: {short_query})", flush=True)
+            return
+        if fetch_openverse_image(short_query, output_image, used_urls):
             print(f"✅ Image fetched from Openverse (short: {short_query})", flush=True)
             return
-        if fetch_wikimedia_image(short_query, output_image):
+        if fetch_wikimedia_image(short_query, output_image, used_urls):
             print(f"✅ Image fetched from Wikimedia (short: {short_query})", flush=True)
             return
 
-    if fetch_openverse_image("technology news", output_image):
+    if fetch_openverse_image("technology news", output_image, used_urls):
         print("✅ Image fetched from Openverse (generic fallback)", flush=True)
         return
 
@@ -327,7 +383,7 @@ def send_video_to_line(video_url: str, project_name: str):
     print(f"LINE Push Status: {res.status_code} {res.text}", flush=True)
 
 
-def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpeg_exe: str) -> str:
+def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpeg_exe: str, used_urls: set) -> str:
     """Render one 720x1280 scene with Ken Burns zoompan + crisp editorial PNG overlay."""
     idx = item.scene
     audio_path = f"{work_dir}/scene_{idx}.mp3"
@@ -336,7 +392,7 @@ def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpe
     scene_mp4 = f"{work_dir}/scene_{idx}.mp4"
 
     print(f"🎨 Scene {idx}: generating image...", flush=True)
-    generate_ai_image(item.visual_search_query, bg_img_path)
+    generate_ai_image(item.visual_search_query, bg_img_path, used_urls)
     create_editorial_overlay(item.on_screen_text, idx, total_scenes, overlay_path)
 
     print(f"🎞️ Scene {idx}: encoding HD video with Ken Burns...", flush=True)
@@ -399,9 +455,10 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str):
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     total_scenes = len(payload.scenes)
     scene_files = []
+    used_urls = set()
 
     for item in payload.scenes:
-        scene_mp4 = render_single_scene(item, total_scenes, work_dir, ffmpeg_exe)
+        scene_mp4 = render_single_scene(item, total_scenes, work_dir, ffmpeg_exe, used_urls)
         scene_files.append(os.path.abspath(scene_mp4))
 
     safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
