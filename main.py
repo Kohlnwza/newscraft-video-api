@@ -6,7 +6,6 @@ import random
 import shutil
 import subprocess
 import sys
-import time
 import uuid
 from typing import List, Optional
 from urllib.parse import quote
@@ -16,7 +15,6 @@ import imageio_ffmpeg
 import requests
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.staticfiles import StaticFiles
-from huggingface_hub import InferenceClient
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel
 
@@ -27,7 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 app = FastAPI(
     title="NewsCraft Video Rendering API",
     description="API สำหรับแปลงสคริปต์ข่าว JSON เป็นวิดีโอสั้นแนวตั้ง 9:16 พร้อมเสียงพากย์ไทยและส่งเข้า LINE OA",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 os.makedirs("outputs", exist_ok=True)
@@ -39,9 +37,10 @@ LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
 VOICE = "th-TH-NiwatNeural"
+VOICE_RATE = "+8%"
 FONT_PATH = "thai_font.ttf"
-VIDEO_WIDTH = 540
-VIDEO_HEIGHT = 960
+VIDEO_WIDTH = 720
+VIDEO_HEIGHT = 1280
 
 
 class SceneItem(BaseModel):
@@ -64,21 +63,21 @@ def health_check():
 
 
 async def generate_tts(text: str, output_audio: str):
-    """Generate Thai voiceover MP3 using edge-tts."""
-    communicate = edge_tts.Communicate(text, VOICE)
+    """Generate energetic Thai news voiceover MP3 using edge-tts."""
+    communicate = edge_tts.Communicate(text, VOICE, rate=VOICE_RATE)
     await communicate.save(output_audio)
 
 
 def create_fallback_image(output_image: str):
-    """Create a dark gradient 9:16 background image when HF_TOKEN is unset or API fails."""
-    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), (18, 24, 38))
+    """Create a dark editorial gradient 9:16 background image."""
+    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), (14, 20, 34))
     draw = ImageDraw.Draw(img)
     for y in range(VIDEO_HEIGHT):
-        r = int(18 + (y / VIDEO_HEIGHT) * 16)
-        g = int(24 + (y / VIDEO_HEIGHT) * 28)
-        b = int(38 + (y / VIDEO_HEIGHT) * 42)
+        r = int(14 + (y / VIDEO_HEIGHT) * 18)
+        g = int(20 + (y / VIDEO_HEIGHT) * 30)
+        b = int(34 + (y / VIDEO_HEIGHT) * 48)
         draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(r, g, b))
-    img.save(output_image)
+    img.save(output_image, quality=92)
 
 
 def fetch_openverse_image(query: str, output_image: str) -> bool:
@@ -100,7 +99,7 @@ def fetch_openverse_image(query: str, output_image: str) -> bool:
                 img_res.raise_for_status()
                 image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
                 image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-                image.save(output_image)
+                image.save(output_image, quality=92)
                 return True
             except Exception:
                 continue
@@ -122,7 +121,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
                 "gsrlimit": 5,
                 "prop": "imageinfo",
                 "iiprop": "url|mime",
-                "iiurlwidth": 720,
+                "iiurlwidth": 1080,
                 "format": "json",
             },
             headers={"User-Agent": "NewsCraftAI/1.0"},
@@ -141,7 +140,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
                 img_res.raise_for_status()
                 image = Image.open(io.BytesIO(img_res.content)).convert("RGB")
                 image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-                image.save(output_image)
+                image.save(output_image, quality=92)
                 return True
             except Exception:
                 continue
@@ -151,7 +150,7 @@ def fetch_wikimedia_image(query: str, output_image: str) -> bool:
 
 
 def generate_ai_image(prompt: str, output_image: str):
-    """Get a vertical 9:16 visual (Pollinations -> Openverse -> Wikimedia -> gradient fallback)."""
+    """Get a vertical 9:16 visual (Pollinations -> Openverse -> Wikimedia -> short query -> fallback)."""
     enhanced_prompt = (
         f"{prompt}, modern editorial news illustration style, cinematic lighting, "
         "high detail, vibrant colors, vertical 9:16 composition, no text, no watermark"
@@ -161,7 +160,7 @@ def generate_ai_image(prompt: str, output_image: str):
         seed = random.randint(1, 999999)
         url = (
             f"https://image.pollinations.ai/prompt/{quote(enhanced_prompt)}"
-            f"?width=544&height=1024&seed={seed}&nologo=true"
+            f"?width=720&height=1344&seed={seed}&nologo=true"
         )
         res = requests.get(url, timeout=18)
         res.raise_for_status()
@@ -169,7 +168,7 @@ def generate_ai_image(prompt: str, output_image: str):
         w, h = image.size
         image = image.crop((0, 0, w, max(1, h - 64)))
         image = ImageOps.fit(image, (VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-        image.save(output_image)
+        image.save(output_image, quality=92)
         return
     except Exception as e:
         print(f"⚠️ Pollinations skipped ({e}), searching Openverse...", flush=True)
@@ -216,7 +215,6 @@ def wrap_thai_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
                 lines.append(current)
                 current = word
             else:
-                # Single long token without spaces: split by character
                 chunk = ""
                 for ch in word:
                     test = chunk + ch
@@ -232,47 +230,70 @@ def wrap_thai_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
     return lines
 
 
-def overlay_headline_on_image(img_path: str, text: str, out_path: str):
-    """Draw Thai headline with semi-transparent dark backdrop and yellow text."""
-    base = Image.open(img_path).convert("RGBA").resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+def create_editorial_overlay(text: str, scene_num: int, total_scenes: int, out_path: str):
+    """Create a transparent 720x1280 PNG overlay with vignette, news badge, and Thai headline card."""
+    overlay = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    font = ImageFont.truetype(FONT_PATH, 34)
-    lines = wrap_thai_text(draw, text.strip(), font, VIDEO_WIDTH - 72)
+    # Top and bottom subtle vignette gradients for readability
+    for y in range(420):
+        alpha = int(175 * (1 - y / 420))
+        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(8, 12, 20, alpha))
+    for y in range(VIDEO_HEIGHT - 260, VIDEO_HEIGHT):
+        progress = (y - (VIDEO_HEIGHT - 260)) / 260
+        alpha = int(160 * progress)
+        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(8, 12, 20, alpha))
 
-    line_height = 50
+    # Top-left brand badge
+    badge_font = ImageFont.truetype(FONT_PATH, 24)
+    draw.rounded_rectangle([(36, 62), (275, 110)], radius=24, fill=(215, 38, 56, 235))
+    draw.text((54, 71), "● NEWSCRAFT AI", font=badge_font, fill=(255, 255, 255, 255))
+
+    # Top-right scene counter pill
+    scene_label = f"{scene_num} / {total_scenes}"
+    draw.rounded_rectangle([(VIDEO_WIDTH - 135, 62), (VIDEO_WIDTH - 36, 110)], radius=24, fill=(15, 23, 42, 200))
+    sb = draw.textbbox((0, 0), scene_label, font=badge_font)
+    sx = (VIDEO_WIDTH - 135) + (99 - (sb[2] - sb[0])) // 2
+    draw.text((sx, 71), scene_label, font=badge_font, fill=(226, 232, 240, 255))
+
+    # Headline card
+    headline_font = ImageFont.truetype(FONT_PATH, 44)
+    lines = wrap_thai_text(draw, text.strip(), headline_font, VIDEO_WIDTH - 120)
+
+    line_height = 64
     total_h = len(lines) * line_height
-    start_y = 170
+    start_y = 185
+    pad_y = 22
 
-    # Subtle dark pill box behind text for high contrast
-    box_pad_y = 18
+    card_top = start_y - pad_y
+    card_bottom = start_y + total_h + pad_y
     draw.rounded_rectangle(
-        [(28, start_y - box_pad_y), (VIDEO_WIDTH - 28, start_y + total_h + box_pad_y)],
-        radius=16,
-        fill=(0, 0, 0, 150),
+        [(36, card_top), (VIDEO_WIDTH - 36, card_bottom)],
+        radius=18,
+        fill=(12, 18, 30, 200),
+        outline=(255, 215, 0, 120),
+        width=2,
     )
+    # Gold left accent bar
+    draw.rounded_rectangle([(36, card_top + 10), (46, card_bottom - 10)], radius=4, fill=(255, 215, 0, 255))
 
     y = start_y
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
+        bbox = draw.textbbox((0, 0), line, font=headline_font)
         text_w = bbox[2] - bbox[0]
-        x = (VIDEO_WIDTH - text_w) // 2
+        x = (VIDEO_WIDTH - text_w) // 2 + 4
         draw.text(
             (x, y),
             line,
-            font=font,
+            font=headline_font,
             fill=(255, 230, 0, 255),
             stroke_width=3,
             stroke_fill=(0, 0, 0, 255),
         )
         y += line_height
 
-    combined = Image.alpha_composite(base, overlay).convert("RGB")
-    combined.save(out_path, quality=92)
-    base.close()
+    overlay.save(out_path)
     overlay.close()
-    combined.close()
 
 
 def send_video_to_line(video_url: str, project_name: str):
@@ -306,47 +327,58 @@ def send_video_to_line(video_url: str, project_name: str):
     print(f"LINE Push Status: {res.status_code} {res.text}", flush=True)
 
 
-def render_single_scene(item: SceneItem, work_dir: str, ffmpeg_exe: str) -> str:
-    """Render one scene with pure Pillow + ffmpeg for minimal RAM usage."""
+def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpeg_exe: str) -> str:
+    """Render one 720x1280 scene with Ken Burns zoompan + crisp editorial PNG overlay."""
     idx = item.scene
     audio_path = f"{work_dir}/scene_{idx}.mp3"
-    raw_img_path = f"{work_dir}/scene_{idx}_raw.png"
-    text_img_path = f"{work_dir}/scene_{idx}_txt.jpg"
+    bg_img_path = f"{work_dir}/scene_{idx}_bg.jpg"
+    overlay_path = f"{work_dir}/scene_{idx}_ov.png"
     scene_mp4 = f"{work_dir}/scene_{idx}.mp4"
 
     print(f"🎨 Scene {idx}: generating image...", flush=True)
-    generate_ai_image(item.visual_search_query, raw_img_path)
-    overlay_headline_on_image(raw_img_path, item.on_screen_text, text_img_path)
+    generate_ai_image(item.visual_search_query, bg_img_path)
+    create_editorial_overlay(item.on_screen_text, idx, total_scenes, overlay_path)
 
-    print(f"🎞️ Scene {idx}: encoding video...", flush=True)
+    print(f"🎞️ Scene {idx}: encoding HD video with Ken Burns...", flush=True)
     subprocess.run(
         [
             ffmpeg_exe,
             "-y",
             "-loop",
             "1",
-            "-framerate",
-            "15",
             "-i",
-            text_img_path,
+            bg_img_path,
+            "-loop",
+            "1",
+            "-i",
+            overlay_path,
             "-i",
             audio_path,
+            "-filter_complex",
+            (
+                "[0:v]scale=1080:1920,"
+                "zoompan=z='min(zoom+0.0012,1.10)':d=720:"
+                "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=24[bg];"
+                "[bg][1:v]overlay=0:0:shortest=1[v]"
+            ),
+            "-map",
+            "[v]",
+            "-map",
+            "2:a",
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
-            "-tune",
-            "stillimage",
             "-threads",
             "1",
             "-crf",
-            "26",
+            "24",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "96k",
+            "128k",
             "-ar",
             "44100",
             "-ac",
@@ -365,10 +397,11 @@ def render_single_scene(item: SceneItem, work_dir: str, ffmpeg_exe: str) -> str:
 def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str):
     """Render each scene sequentially and concat with ffmpeg stream copy."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    total_scenes = len(payload.scenes)
     scene_files = []
 
     for item in payload.scenes:
-        scene_mp4 = render_single_scene(item, work_dir, ffmpeg_exe)
+        scene_mp4 = render_single_scene(item, total_scenes, work_dir, ffmpeg_exe)
         scene_files.append(os.path.abspath(scene_mp4))
 
     safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
