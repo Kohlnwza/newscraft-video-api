@@ -3,7 +3,6 @@ import gc
 import io
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -287,18 +286,18 @@ def wrap_thai_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
     return lines
 
 
-def create_static_chrome_overlay(scene_num: int, total_scenes: int, out_path: str):
-    """Create static top/bottom vignette, brand badge, and scene counter PNG."""
+def create_editorial_overlay(text: str, scene_num: int, total_scenes: int, out_path: str):
+    """Create a transparent 720x1280 PNG overlay with vignette, news badge, and Thai headline card."""
     overlay = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Top and bottom subtle vignette gradients
+    # Top and bottom subtle vignette gradients for readability
     for y in range(420):
         alpha = int(175 * (1 - y / 420))
         draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(8, 12, 20, alpha))
     for y in range(VIDEO_HEIGHT - 260, VIDEO_HEIGHT):
         progress = (y - (VIDEO_HEIGHT - 260)) / 260
-        alpha = int(165 * progress)
+        alpha = int(160 * progress)
         draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(8, 12, 20, alpha))
 
     # Top-left brand badge
@@ -313,18 +312,7 @@ def create_static_chrome_overlay(scene_num: int, total_scenes: int, out_path: st
     sx = (VIDEO_WIDTH - 135) + (99 - (sb[2] - sb[0])) // 2
     draw.text((sx, 71), scene_label, font=badge_font, fill=(226, 232, 240, 255))
 
-    # Subtle track for bottom progress bar
-    draw.rectangle([(0, VIDEO_HEIGHT - 8), (VIDEO_WIDTH, VIDEO_HEIGHT)], fill=(255, 255, 255, 45))
-
-    overlay.save(out_path)
-    overlay.close()
-
-
-def create_headline_card_overlay(text: str, out_path: str):
-    """Create transparent PNG containing only the Thai headline card (for slide-in animation)."""
-    overlay = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
+    # Headline card
     headline_font = ImageFont.truetype(FONT_PATH, 44)
     lines = wrap_thai_text(draw, text.strip(), headline_font, VIDEO_WIDTH - 120)
 
@@ -338,10 +326,11 @@ def create_headline_card_overlay(text: str, out_path: str):
     draw.rounded_rectangle(
         [(36, card_top), (VIDEO_WIDTH - 36, card_bottom)],
         radius=18,
-        fill=(12, 18, 30, 205),
-        outline=(255, 215, 0, 140),
+        fill=(12, 18, 30, 200),
+        outline=(255, 215, 0, 120),
         width=2,
     )
+    # Gold left accent bar
     draw.rounded_rectangle([(36, card_top + 10), (46, card_bottom - 10)], radius=4, fill=(255, 215, 0, 255))
 
     y = start_y
@@ -363,17 +352,7 @@ def create_headline_card_overlay(text: str, out_path: str):
     overlay.close()
 
 
-def get_audio_duration(ffmpeg_exe: str, audio_path: str) -> float:
-    """Get audio duration in seconds via ffmpeg stderr output."""
-    res = subprocess.run([ffmpeg_exe, "-i", audio_path], capture_output=True, text=True)
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
-    if not m:
-        return 5.0
-    h, mins, secs = int(m.group(1)), int(m.group(2)), float(m.group(3))
-    return max(1.0, h * 3600 + mins * 60 + secs)
-
-
-def send_video_to_line(video_url: str, preview_url: str, project_name: str):
+def send_video_to_line(video_url: str, project_name: str):
     """Push the rendered .mp4 video URL back to the LINE OA chat."""
     if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_USER_ID):
         print("⚠️ LINE_CHANNEL_ACCESS_TOKEN or LINE_USER_ID not configured.", flush=True)
@@ -396,7 +375,7 @@ def send_video_to_line(video_url: str, preview_url: str, project_name: str):
             {
                 "type": "video",
                 "originalContentUrl": video_url,
-                "previewImageUrl": preview_url,
+                "previewImageUrl": "https://images.pexels.com/photos/373543/pexels-photo-373543.jpeg?auto=compress&cs=tinysrgb&w=600",
             },
         ],
     }
@@ -405,48 +384,18 @@ def send_video_to_line(video_url: str, preview_url: str, project_name: str):
 
 
 def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpeg_exe: str, used_urls: set) -> str:
-    """Render one 720x1280 scene with alternating camera motion, slide-in headline, and progress bar."""
+    """Render one 720x1280 scene with Ken Burns zoompan + crisp editorial PNG overlay."""
     idx = item.scene
     audio_path = f"{work_dir}/scene_{idx}.mp3"
     bg_img_path = f"{work_dir}/scene_{idx}_bg.jpg"
-    chrome_path = f"{work_dir}/scene_{idx}_chrome.png"
-    card_path = f"{work_dir}/scene_{idx}_card.png"
+    overlay_path = f"{work_dir}/scene_{idx}_ov.png"
     scene_mp4 = f"{work_dir}/scene_{idx}.mp4"
 
     print(f"🎨 Scene {idx}: generating image...", flush=True)
     generate_ai_image(item.visual_search_query, bg_img_path, used_urls)
-    create_static_chrome_overlay(idx, total_scenes, chrome_path)
-    create_headline_card_overlay(item.on_screen_text, card_path)
+    create_editorial_overlay(item.on_screen_text, idx, total_scenes, overlay_path)
 
-    duration = get_audio_duration(ffmpeg_exe, audio_path)
-    frames = max(40, int(duration * 20) + 10)
-
-    # Alternate camera motion per scene: 1=Zoom-in, 2=Zoom-out, 3=Pan L->R
-    motion_mode = idx % 3
-    if motion_mode == 1:
-        zoom_expr = (
-            f"zoompan=z='min(zoom+0.0014,1.10)':d={frames}:"
-            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=20"
-        )
-    elif motion_mode == 2:
-        zoom_expr = (
-            f"zoompan=z='if(eq(on,1),1.10,max(zoom-0.0012,1.0))':d={frames}:"
-            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=20"
-        )
-    else:
-        zoom_expr = (
-            f"zoompan=z='1.08':d={frames}:"
-            f"x='(iw-iw/zoom)*min(on/{frames},1)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=20"
-        )
-
-    filter_complex = (
-        f"[0:v]scale=800:1422,{zoom_expr}[bg];"
-        "[bg][1:v]overlay=0:0:shortest=1[bg_chrome];"
-        "[bg_chrome][2:v]overlay=x='if(lt(t,0.45),-720*(1-t/0.45)*(1-t/0.45),0)':y=0:shortest=1[with_card];"
-        f"[with_card]drawbox=x=0:y=1272:w='720*min(t/{duration:.2f},1)':h=8:color=0xFFD700@0.95:t=fill[v]"
-    )
-
-    print(f"🎞️ Scene {idx}: encoding motion graphics ({duration:.1f}s)...", flush=True)
+    print(f"🎞️ Scene {idx}: encoding HD video with Ken Burns...", flush=True)
     subprocess.run(
         [
             ffmpeg_exe,
@@ -458,19 +407,20 @@ def render_single_scene(item: SceneItem, total_scenes: int, work_dir: str, ffmpe
             "-loop",
             "1",
             "-i",
-            chrome_path,
-            "-loop",
-            "1",
-            "-i",
-            card_path,
+            overlay_path,
             "-i",
             audio_path,
             "-filter_complex",
-            filter_complex,
+            (
+                "[0:v]scale=1080:1920,"
+                "zoompan=z='min(zoom+0.0012,1.10)':d=720:"
+                "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=24[bg];"
+                "[bg][1:v]overlay=0:0:shortest=1[v]"
+            ),
             "-map",
             "[v]",
             "-map",
-            "3:a",
+            "2:a",
             "-c:v",
             "libx264",
             "-preset",
@@ -514,8 +464,6 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str):
     safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
     output_filename = f"{safe_project}_{job_id}.mp4"
     output_path = f"outputs/{output_filename}"
-    thumb_filename = f"{safe_project}_{job_id}_thumb.jpg"
-    thumb_path = f"outputs/{thumb_filename}"
 
     concat_list_path = f"{work_dir}/concat.txt"
     with open(concat_list_path, "w", encoding="utf-8") as f:
@@ -541,23 +489,11 @@ def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str):
         stderr=subprocess.PIPE,
     )
 
-    # Extract a real thumbnail from 0.8s into the video for LINE preview
-    subprocess.run(
-        [ffmpeg_exe, "-y", "-ss", "0.8", "-i", output_path, "-vframes", "1", "-q:v", "3", thumb_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
     base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://localhost:8000"
     public_video_url = f"{base_url}/outputs/{output_filename}"
-    preview_url = (
-        f"{base_url}/outputs/{thumb_filename}"
-        if os.path.exists(thumb_path)
-        else "https://images.pexels.com/photos/373543/pexels-photo-373543.jpeg?auto=compress&cs=tinysrgb&w=600"
-    )
     print(f"✅ Render complete: {output_path}", flush=True)
 
-    send_video_to_line(public_video_url, preview_url, payload.project)
+    send_video_to_line(public_video_url, payload.project)
 
 
 async def process_and_render_video(payload: VideoPayload, job_id: str):
