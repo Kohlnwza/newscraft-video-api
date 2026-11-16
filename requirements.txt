@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+edge-tts
+moviepy>=2.0.0
+requests
+pillow
+huggingface_hub
