@@ -1,10 +1,13 @@
 import asyncio
+import gc
 import os
 import shutil
+import subprocess
 import uuid
 from typing import List, Optional
 
 import edge_tts
+import imageio_ffmpeg
 import requests
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -14,7 +17,6 @@ from moviepy import (
     CompositeVideoClip,
     ImageClip,
     TextClip,
-    concatenate_videoclips,
 )
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
@@ -35,6 +37,8 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 VOICE = "th-TH-NiwatNeural"
 FONT_PATH = "thai_font.ttf"
+VIDEO_WIDTH = 720
+VIDEO_HEIGHT = 1280
 
 
 class SceneItem(BaseModel):
@@ -64,7 +68,7 @@ async def generate_tts(text: str, output_audio: str):
 
 def create_fallback_image(output_image: str):
     """Create a dark gradient 9:16 background image when HF_TOKEN is unset or API fails."""
-    width, height = 768, 1344
+    width, height = 544, 960
     img = Image.new("RGB", (width, height), (18, 24, 38))
     draw = ImageDraw.Draw(img)
     for y in range(height):
@@ -91,8 +95,8 @@ def generate_ai_image(prompt: str, output_image: str):
         image = client.text_to_image(
             prompt=enhanced_prompt,
             model="black-forest-labs/FLUX.1-schnell",
-            width=768,
-            height=1344,
+            width=544,
+            height=960,
         )
         image.save(output_image)
     except Exception as e:
@@ -101,10 +105,10 @@ def generate_ai_image(prompt: str, output_image: str):
 
 
 def apply_ken_burns_zoom(img_path: str, duration: float):
-    """Apply subtle Ken Burns zoom-in effect to a 1080x1920 image clip."""
-    clip = ImageClip(img_path).with_duration(duration).resized((1080, 1920))
-    zoomed_clip = clip.resized(lambda t: 1.0 + 0.08 * (t / duration))
-    return CompositeVideoClip([zoomed_clip.with_position("center")], size=(1080, 1920))
+    """Apply subtle Ken Burns zoom-in effect to a 720x1280 image clip."""
+    clip = ImageClip(img_path).with_duration(duration).resized((VIDEO_WIDTH, VIDEO_HEIGHT))
+    zoomed_clip = clip.resized(lambda t: 1.0 + 0.06 * (t / duration))
+    return CompositeVideoClip([zoomed_clip.with_position("center")], size=(VIDEO_WIDTH, VIDEO_HEIGHT))
 
 
 def send_video_to_line(video_url: str, project_name: str):
@@ -138,62 +142,95 @@ def send_video_to_line(video_url: str, project_name: str):
     print("LINE Push Status:", res.status_code, res.text)
 
 
-def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_durations: dict):
-    """Assemble scenes synchronously in a worker thread to keep the event loop responsive."""
-    scene_clips = []
-    audio_clips = []
-    final_video = None
+def render_single_scene(item: SceneItem, work_dir: str, duration: float) -> str:
+    """Render one scene to a standalone MP4 to keep peak RAM well below 512 MB."""
+    idx = item.scene
+    audio_path = f"{work_dir}/scene_{idx}.mp3"
+    img_path = f"{work_dir}/scene_{idx}.png"
+    scene_mp4 = f"{work_dir}/scene_{idx}.mp4"
+
+    generate_ai_image(item.visual_search_query, img_path)
+
+    audio_clip = None
+    bg_clip = None
+    txt_clip = None
+    scene_composite = None
 
     try:
-        for item in payload.scenes:
-            idx = item.scene
-            audio_path = f"{work_dir}/scene_{idx}.mp3"
-            img_path = f"{work_dir}/scene_{idx}.png"
-
-            generate_ai_image(item.visual_search_query, img_path)
-
-            audio_clip = AudioFileClip(audio_path)
-            audio_clips.append(audio_clip)
-            duration = audio_durations[idx]
-
-            bg_clip = apply_ken_burns_zoom(img_path, duration)
-            txt_clip = (
-                TextClip(
-                    text=item.on_screen_text,
-                    font=FONT_PATH,
-                    font_size=68,
-                    color="yellow",
-                    stroke_color="black",
-                    stroke_width=4,
-                    method="caption",
-                    size=(920, None),
-                    margin=(20, 20),
-                )
-                .with_position(("center", 350))
-                .with_duration(duration)
+        audio_clip = AudioFileClip(audio_path)
+        bg_clip = apply_ken_burns_zoom(img_path, duration)
+        txt_clip = (
+            TextClip(
+                text=item.on_screen_text,
+                font=FONT_PATH,
+                font_size=46,
+                color="yellow",
+                stroke_color="black",
+                stroke_width=3,
+                method="caption",
+                size=(620, None),
+                margin=(16, 16),
             )
-            scene_composite = CompositeVideoClip([bg_clip, txt_clip]).with_audio(audio_clip)
-            scene_clips.append(scene_composite)
-
-        safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
-        output_filename = f"{safe_project}_{job_id}.mp4"
-        output_path = f"outputs/{output_filename}"
-
-        final_video = concatenate_videoclips(scene_clips, method="compose")
-        final_video.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac")
-
-        base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://localhost:8000"
-        public_video_url = f"{base_url}/outputs/{output_filename}"
-        print(f"✅ Render complete: {output_path}")
-
-        send_video_to_line(public_video_url, payload.project)
+            .with_position(("center", 230))
+            .with_duration(duration)
+        )
+        scene_composite = CompositeVideoClip([bg_clip, txt_clip]).with_audio(audio_clip)
+        scene_composite.write_videofile(
+            scene_mp4,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            ffmpeg_params=["-preset", "ultrafast", "-threads", "1", "-crf", "26"],
+            logger=None,
+        )
     finally:
-        if final_video is not None:
-            final_video.close()
-        for clip in scene_clips:
-            clip.close()
-        for a_clip in audio_clips:
-            a_clip.close()
+        for clip in (scene_composite, txt_clip, bg_clip, audio_clip):
+            if clip is not None:
+                clip.close()
+        gc.collect()
+
+    return scene_mp4
+
+
+def render_video_sync(payload: VideoPayload, job_id: str, work_dir: str, audio_durations: dict):
+    """Render each scene sequentially and concat with ffmpeg stream copy."""
+    scene_files = []
+    for item in payload.scenes:
+        scene_mp4 = render_single_scene(item, work_dir, audio_durations[item.scene])
+        scene_files.append(os.path.abspath(scene_mp4))
+
+    safe_project = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in payload.project)
+    output_filename = f"{safe_project}_{job_id}.mp4"
+    output_path = f"outputs/{output_filename}"
+
+    concat_list_path = f"{work_dir}/concat.txt"
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for path in scene_files:
+            f.write(f"file '{path}'\n")
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [
+            ffmpeg_exe,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_list_path,
+            "-c",
+            "copy",
+            output_path,
+        ],
+        check=True,
+    )
+
+    base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://localhost:8000"
+    public_video_url = f"{base_url}/outputs/{output_filename}"
+    print(f"✅ Render complete: {output_path}")
+
+    send_video_to_line(public_video_url, payload.project)
 
 
 async def process_and_render_video(payload: VideoPayload, job_id: str):
